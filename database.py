@@ -1,44 +1,50 @@
 import aiosqlite
+import time
+
+# Имя базы. Оставляем v5, чтобы создалась новая структура.
+DB_NAME = 'english_bot_v5.db' 
 
 async def create_table():
-    async with aiosqlite.connect('english_bot.db') as db:
+    async with aiosqlite.connect(DB_NAME) as db:
         await db.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
-                reg_date TEXT,
-                messages_count INTEGER DEFAULT 0
+                first_name TEXT, 
+                messages_count INTEGER DEFAULT 0,
+                last_active INTEGER
             )
         ''')
         await db.commit()
-        
 
-# Функция добавления юзера
-async def add_user(user_id, username):
-    # Подключаемся к файлу базы (он сам создастся, если нет)
-    async with aiosqlite.connect('english_bot.db') as db:
-        # Выполняем наш SQL с защитой от дублей
+async def add_user(user_id, username, first_name):
+    async with aiosqlite.connect(DB_NAME) as db:
+        current_time = int(time.time())
         await db.execute(
-            "INSERT OR IGNORE INTO users (user_id, username, messages_count) VALUES (?, ?, 0)",
-            (user_id, username) # Вот тут Python подставляет данные вместо вопросов
+            "INSERT OR IGNORE INTO users (user_id, username, first_name, messages_count, last_active) VALUES (?, ?, ?, 0, ?)",
+            (user_id, username, first_name, current_time)
         )
-        # ОБЯЗАТЕЛЬНО сохраняем изменения
         await db.commit()
 
-# 👇 НОВАЯ ФУНКЦИЯ: Увеличить счетчик сообщений
+# 👇 ВОТ ОНА! Вернули родную.
+# Теперь она делает ДВА дела сразу: +1 сообщение и обновляет время.
 async def increment_counter(user_id):
-    async with aiosqlite.connect('english_bot.db') as db:
+    async with aiosqlite.connect(DB_NAME) as db:
+        current_time = int(time.time())
         await db.execute(
-            "UPDATE users SET messages_count = messages_count + 1 WHERE user_id = ?",
-            (user_id,)
+            "UPDATE users SET messages_count = messages_count + 1, last_active = ? WHERE user_id = ?",
+            (current_time, user_id)
         )
         await db.commit()
 
-# 👇 НОВАЯ ФУНКЦИЯ: Получить статистику
 async def get_user_stats(user_id):
-    async with aiosqlite.connect('english_bot.db') as db:
+    async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT messages_count FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
-            if row:
-                return row[0] # Возвращаем число (например, 5)
-            return 0
+            return row[0] if row else 0
+
+async def get_inactive_users(interval_seconds):
+    async with aiosqlite.connect(DB_NAME) as db:
+        limit_time = int(time.time()) - interval_seconds
+        async with db.execute("SELECT user_id, first_name FROM users WHERE last_active < ?", (limit_time,)) as cursor:
+            return await cursor.fetchall()
