@@ -5,7 +5,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from config import BOT_TOKEN
 from ai_service import get_ai_service # Импортируем функцию общения с AI
-from keyboards import main_kb
+from keyboards import main_kb, modes_kb
 import os
 import speech_recognition as sr
 from aiogram import F
@@ -34,6 +34,13 @@ user_histories = {}
 SYSTEM_PROMPT = """
 You are an elite English Tutor AI. Your name is EnglishBot.
 Your goal is to simulate a natural conversation with a friend who is an English teacher.
+### 🛡️ SAFETY PROTOCOL (HIGHEST PRIORITY):
+If the user mentions violence, self-harm, illegal acts, or extreme toxicity (even as a joke):
+1.  **STOP** the roleplay immediately.
+2.  Do **NOT** correct their grammar.
+3.  Do **NOT** ask follow-up questions like "What do you like about it?".
+4.  Reply firmly but briefly: "I cannot discuss this topic. Let's talk about something else."
+5.  If they persist, just reply: "Let's change the topic."
 
 ### CORE INSTRUCTIONS:
 1.  **Language:** Communicate in English ONLY. Use Russian only if the user explicitly asks for an explanation in Russian.
@@ -45,6 +52,12 @@ Before answering, analyze the user's message for GRAVE errors (grammar, wrong vo
 -   **IGNORE** minor stylistic choices or informal slang (e.g., "gonna", "wanna" are OK).
 -   **IGNORE** short valid answers (e.g., "Yes", "Me", "Not really", "In London"). Do NOT correct "Me" to "It is me".
 -   **LONG TEXTS:** If the user writes a long sentence, DO NOT rewrite the whole sentence. Quote ONLY the part with the error + 1-2 surrounding words for context.
+
+### ROLEPLAY CONTEXT:
+The user may select a mode. Adapt your persona accordingly:
+- Default: Friendly Tutor.
+- Travel: Customs officer, waiter, or local guide. Be helpful but realistic.
+- Job Interview: Strict but professional HR manager. Ask interview questions.
 
 ### RESPONSE STRUCTURE:
 
@@ -197,6 +210,41 @@ async def voice_handler(message: types.Message):
         if os.path.exists(filename):
             os.remove(filename)
 
+@dp.callback_query(F.data.startswith("mode_"))
+async def mode_selection_handler(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    mode = callback.data.split("_")[1]
+    
+    mode_text = ""
+    new_instruction = ""
+
+    if mode == "tutor":
+        mode_text = "🦉 Режим: Учитель"
+        new_instruction = "System Update: Act as a friendly English Tutor."
+    elif mode == "travel":
+        mode_text = "✈️ Режим: Путешествия"
+        new_instruction = "System Update: Act as a Airport Customs Officer or Waiter. Immerse the user in a travel scenario."
+    elif mode == "job":
+        mode_text = "💼 Режим: Собеседование"
+        new_instruction = "System Update: Act as a HR Manager conducting a job interview. Ask professional questions."
+
+    # Обновляем память бота новой инструкцией
+    # Мы добавляем это как "системное сообщение" в историю
+    if user_id not in user_histories:
+        user_histories[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    
+    user_histories[user_id].append({"role": "system", "content": new_instruction})
+    
+    await callback.message.answer(f"{mode_text} активирован! Начинаем.", reply_markup=main_kb)
+    await callback.answer() # Чтобы часики на кнопке пропали
+    
+    # Можно сразу пнуть бота, чтобы он начал диалог в новой роли
+    # (Опционально, но круто)
+    ai_answer = await get_ai_service(user_histories[user_id])
+    user_histories[user_id].append({"role": "assistant", "content": ai_answer})
+    clean_text = ai_answer.replace("|||", "")
+    await callback.message.answer(clean_text, parse_mode="HTML")
+
 @dp.message() 
 async def chat_handler(message: types.Message):
     """Обрабатывает ВСЕ остальные сообщения (текст)"""
@@ -234,6 +282,9 @@ async def chat_handler(message: types.Message):
             "<i>Я использую искусственный интеллект (GPT4o-mini), поэтому иногда могу ошибаться. Учимся вместе!</i>"
         )
         await message.answer(help_text, parse_mode="HTML")
+        return
+    elif user_text == "🎭 Режимы":
+        await message.answer("Выберите режим общения:", reply_markup=modes_kb)
         return
     
     await increment_counter(user_id)
