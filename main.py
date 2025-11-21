@@ -11,6 +11,9 @@ import os
 import speech_recognition as sr
 from aiogram import F
 from pydub import AudioSegment
+from gtts import gTTS  # 👈 NEW: Библиотека озвучки
+from aiogram.types import FSInputFile # 👈 NEW: Для отправки файлов
+from database import create_table, add_user, increment_counter, get_user_stats
 
 # Включаем логирование
 logging.basicConfig(level=logging.INFO)
@@ -28,12 +31,19 @@ user_histories = {}
 SYSTEM_PROMPT = """
 Ты — эмпатичный репетитор английского языка.
 1. Общайся на английском.
-2. Если юзер делает ошибку — ТВОЙ ОТВЕТ ДОЛЖЕН НАЧИНАТЬСЯ С БЛОКА ИСПРАВЛЕНИЯ.
+2. Если юзер делает ошибку — ТВОЙ ОТВЕТ ДОЛЖЕН НАЧИНАТЬСЯ С БЛОКА ИСПРАВЛЕНИЯ, где ты показываешь ошибку и правильный вариант, \n
+исправляй не только ошибки в словах, но и в построении предложения.
    Используй строго такой формат:
    🏁 <b>Correction:</b> <s>Текст с ошибкой</s> -> <b>Правильный текст</b>
+   ПОСЛЕ блока исправления ОБЯЗАТЕЛЬНО поставь разделитель: |||
+   Пример:
+   🏁 <b>Correction:</b> ... ||| Oh, I see! Let's talk about it.
    
 3. Если ошибок нет — просто поддерживай диалог.
-4. Используй HTML-теги: <b>bold</b> для правильного варианта, <s>strike</s> для зачеркивания ошибки.
+4. ВАЖНО: Делай перенос строки после исправления
+5. Ответь на русском языке, если пользователь попросил что-то объяснить, но после ВСЕГДА предлагай продолжить диалог на английском.
+6. НЕ ЗАБЫВАЙ про флажочек перед словом Correction.
+7. Используй HTML-теги: <b>bold</b> для правильного варианта, <s>strike</s> для зачеркивания ошибки.
 """
 
 # --- ХЭНДЛЕРЫ ---
@@ -52,9 +62,11 @@ async def cmd_start(message: types.Message):
     ]
     
     await message.answer(
-            f"Hello, {user_name}! I am your English Tutor. Let's talk!",
-            reply_markup=main_kb 
-        )
+        f"Привет, {user_name}! Я твой ИИ-репетитор по английскому. 🇬🇧\n\n"
+        f"Мы можем общаться голосом или текстом. Я буду исправлять твои ошибки.\n"
+        f"Просто напиши или скажи мне что-нибудь на английском!",
+        reply_markup=main_kb 
+    )
     
 @dp.message(Command("clear"))
 async def cmd_clear(message: types.Message):
@@ -67,7 +79,7 @@ async def cmd_clear(message: types.Message):
 @dp.message(F.voice)
 async def voice_handler(message: types.Message):
     user_id = message.from_user.id
-    
+
     # 1. ЗАЩИТА ОТ ЗАБЫВЧИВОСТИ (Fix KeyError)
     # Если бот перезагрузился и не помнит юзера - создаем память заново
     if user_id not in user_histories:
@@ -79,9 +91,14 @@ async def voice_handler(message: types.Message):
 
     ogg_filename = f"voice_{user_id}.ogg"
     wav_filename = f"voice_{user_id}.wav"
+    reply_audio_filename = f"reply_{user_id}.mp3"
 
     try:
         # 2. Скачиваем
+        file_id = message.voice.file_id
+        file = await bot.get_file(file_id)
+        file_path = file.file_path
+        await bot.download_file(file_path, ogg_filename)
         file_id = message.voice.file_id
         file = await bot.get_file(file_id)
         file_path = file.file_path
@@ -117,9 +134,35 @@ async def voice_handler(message: types.Message):
         
         # Сохраняем ответ бота
         user_histories[user_id].append({"role": "assistant", "content": ai_answer})
+        text_for_chat = ai_answer.replace("|||", "")
+        await message.answer(text_for_chat, parse_mode="HTML")
 
-        # Отправляем ответ (отдельным сообщением, чтобы было красиво)
-        await message.answer(ai_answer, parse_mode="HTML")
+        await bot.send_chat_action(chat_id=message.chat.id, action="record_voice")
+
+        
+        # 2. Готовим текст для голоса
+        # Если есть разделитель ||| - берем только то, что ПОСЛЕ него
+        if "|||" in ai_answer:
+            text_for_voice = ai_answer.split("|||")[1]
+        else:
+            text_for_voice = ai_answer
+
+        # 3. Очищаем от HTML тегов (чтобы не читал <b>, <s>)
+        # Используем регулярку, чтобы удалить всё внутри <...>
+        
+        import re
+        clean_voice_text = re.sub(r'<[^>]+>', '', text_for_voice).strip()
+        await increment_counter(user_id)
+
+        if clean_voice_text:
+            tts = gTTS(text=clean_voice_text, lang='en')
+            tts.save(reply_audio_filename)
+            
+            # Отправляем файл
+            voice_file = FSInputFile(reply_audio_filename)
+            await message.answer_voice(voice_file)
+    
+        # 4. Озвучиваем чистый текст
 
     except sr.UnknownValueError:
         await status_msg.edit_text("🤔 Я не понял твою речь, попробуй повторить.")
@@ -150,15 +193,32 @@ async def chat_handler(message: types.Message):
         return # 👈 ВАЖНО: Выходим из функции, чтобы не отправлять это в AI
 
     elif user_text == "👤 Профиль":
-        # Покажем простую инфу
-        # (Позже будем брать из базы данных кол-во слов)
-        msg_count = len(user_histories.get(user_id, [])) - 1 # Минус системный промпт
-        await message.answer(f"👤 **Профиль:**\nИмя: {message.from_user.first_name}\nСообщений в памяти: {msg_count}", parse_mode="Markdown")
+        # 👇 ТЫ ПРОПУСТИЛ ВОТ ЭТУ СТРОЧКУ 👇
+        # Мы создаем переменную total_msgs и кладем туда результат из базы
+        total_msgs = await get_user_stats(user_id) 
+        
+        # И только ТЕПЕРЬ мы можем её использовать внутри f-строки:
+        profile_text = (
+            f"👤 <b>Твой профиль</b>\n\n"
+            f"Имя: {message.from_user.first_name}\n"
+            f"Всего сообщений: <b>{total_msgs}</b> 🔥\n\n" # <--- Здесь она подставляется
+            f"<i>Продолжай практиковаться!</i>"
+        )
+        await message.answer(profile_text, parse_mode="HTML")
         return
 
     elif user_text == "🆘 Справка":
-        await message.answer("Просто напиши мне на английском, я буду общаться с тобой, поправляя все ошибки.\nНажми на 'Сбросить чат', чтобы очистить историю.")
+        help_text = (
+            "🤖 <b>Как пользоваться ботом:</b>\n\n"
+            "1. 🗣 <b>Голосовые:</b> Отправь мне голосовое сообщение. Я послушаю произношение, исправлю ошибки и отвечу голосом!\n"
+            "2. ✍️ <b>Текст:</b> Просто пиши на английском. Я поддержу диалог и укажу на грамматику.\n"
+            "3. 🔄 <b>Новая тема:</b> Нажми эту кнопку, если хочешь сменить тему разговора.\n\n"
+            "<i>Я использую искусственный интеллект (Llama 3), поэтому иногда могу ошибаться. Учимся вместе!</i>"
+        )
+        await message.answer(help_text, parse_mode="HTML")
         return
+    
+    await increment_counter(user_id)
     
     # Если юзер пишет первый раз без /start, создаем ему историю
     if user_id not in user_histories:
@@ -175,8 +235,8 @@ async def chat_handler(message: types.Message):
     ai_answer = await get_ai_service(user_histories[user_id])
 
     user_histories[user_id].append({"role": "assistant", "content": ai_answer})
-
-    await message.answer(ai_answer, parse_mode="HTML")
+    clean_text = ai_answer.replace("|||", "")
+    await message.answer(clean_text, parse_mode="HTML")
     
 
 
